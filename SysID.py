@@ -15,6 +15,7 @@ import pickle as pkl
 import os
 import importlib
 import json
+import pandas as pd
 
 # ================================================================================================================================ #
 # Local Imports
@@ -51,6 +52,7 @@ class Model:
             self.CurrentModel = None
             self.x_train = None
             self.y_train = None
+            self._save_as_pkl = False
         else:
             raise ValueError('[ ERROR ] Technique: "{}" not recognized. \nExpected: {}'.format(Technique, self._techniques))
 
@@ -254,8 +256,13 @@ class Model:
         self._techniqueModule.save(ModelPath, self.CurrentModel)
         # Save training data, if true
         if saveTrainingData:
-            with open(os.path.join(MetaDataPath, 'trainingData.pkl'), 'wb') as f:
-                pkl.dump({'x':self.x_train, 'y':self.y_train}, f)
+            if self._save_as_pkl:
+                with open(os.path.join(MetaDataPath, 'trainingData.pkl'), 'wb') as f:
+                    pkl.dump({'x':self.x_train, 'y':self.y_train}, f)
+            else:
+                self.__pd_to_dict()
+                with open(os.path.join(MetaDataPath, 'trainingData.json'), 'w') as f:
+                    json.dump(self.packed, f, indent=4)
         return None
 
 
@@ -294,11 +301,21 @@ class Model:
             mdl.CompiledModel = currentModel
         # Add training data, if available
         if 'has training data' in metadata.keys():
-            if metadata['has training data']:
-                with open(os.path.join(MetaDataPath, 'trainingData.pkl'), 'rb') as f:
-                    trainingData = pkl.load(f)
-                mdl.x_train = trainingData['x']
-                mdl.y_train = trainingData['y']
+            try:
+                if metadata['has training data']:
+                    if os.path.exists(os.path.join(MetaDataPath, 'trainingData.pkl')):
+                        with open(os.path.join(MetaDataPath, 'trainingData.pkl'), 'rb') as f:
+                            trainingData = pkl.load(f)
+                        mdl.x_train = trainingData['x']
+                        mdl.y_train = trainingData['y']
+                    elif os.path.exists(os.path.join(MetaDataPath, 'trainingData.json')):
+                        with open(os.path.join(MetaDataPath, 'trainingData.json'), 'r') as f:
+                            packed = json.load(f)
+                        unpacked = mdl.__dict_to_pd(packed)
+                        mdl.x_train = unpacked['x']
+                        mdl.y_train = unpacked['y']
+            except Exception as e:
+                print(f'[ WARNING ] Found trainingData is metadata but failed to load them.\nThe following error occurred:\n\t{e}')
         return mdl
 
 
@@ -319,3 +336,20 @@ class Model:
         else:
             raise NotImplementedError('Can only copy TrainedModel')
         return modelCopy
+    
+    def __pd_to_dict(self):
+        self.packed = {}
+        for k, pd_data in {'x':self.x_train, 'y':self.y_train}.items():
+            if isinstance(pd_data, pd.Series):
+                pd_data = pd_data.to_frame(name = pd_data.name)
+            self.packed.update({k:{
+                'df':pd_data.to_dict(orient = 'split'),
+                'dtypes': {c:str(dt) for c, dt in pd_data.dtypes.items()}
+            }})
+
+    def __dict_to_pd(self, packed):
+        unpacked = {}
+        for k, d_data in packed.items():
+            df = pd.DataFrame(d_data['df']['data'], index = d_data['df']['index'], columns = d_data['df']['columns'])
+            #TODO: Restore appropriate dtypes. In current use, all entries (aside from index) are floats. 
+            unpacked.update({k:df})

@@ -107,6 +107,33 @@ def _OLS(A, z, hasBias = True):
     return [params, pred]
 
 
+def _OLS_FLEX(A, z, hasBias = True, fixed_mapping = {}):
+    '''Wrapper for the _OLS function that accounts for regressors with fixed coefficients
+    '''
+    # fixed_mapping maps the index of the fixed regressor, in A, to its coefficient value
+    if len(fixed_mapping):
+        nr = A.shape[1]
+        fixed_idxs = list(fixed_mapping.keys())
+        params_fixed = np.array([v['coeff'] for v in fixed_mapping.values()]).reshape(-1, 1)
+        flex_idxs = [i for i in np.arange(0, nr, 1) if i not in fixed_idxs]
+        A_fixed = np.delete(A, flex_idxs, 1)
+        A_flex = np.delete(A, fixed_idxs, 1)
+        pred_fixed = A_fixed @ params_fixed
+        z_adjusted = z - pred_fixed
+        # Catch for if bias is fixed -> make hasBias = False. 
+        fixed_regs = [v['regressor'] for v in fixed_mapping.values()]
+        hasBias = not hasBias if 'bias' in fixed_regs else hasBias
+        [params_flex, pred_flex] = _OLS(A_flex, z_adjusted, hasBias=hasBias)
+        params = np.zeros((nr, 1))
+        params[fixed_idxs] = params_fixed
+        params[flex_idxs] = params_flex
+        pred = pred_flex + pred_fixed
+        return [np.matrix(params), pred]
+    else:
+        # No fixed_mapping
+        return _OLS(A, z, hasBias=hasBias)
+
+
 
 def _PSE(predictions, targets, p):
     '''(Internal) Function to determine the predict square error, PSE
@@ -362,7 +389,7 @@ def _RMSE(y, yhat):
 
 
 
-def compile(data, polys, fixedParams, includeBias = True):
+def compile(data, polys, fixedParams, includeBias = True, fixed_coefficients = {}):
     '''Function to build model regressors (both candidate and fixed)
 
     :param data: Pandas DataFrame containing inputs for the model where columns denote the input variables and rows the number of samples
@@ -383,19 +410,39 @@ def compile(data, polys, fixedParams, includeBias = True):
     CandidateRegressors = _BuildCandidateRegressors(polys, data)
     FixedRegressors = _BuildFixedRegressors(fixedParams, data, addBiasVector=includeBias)
 
+    # Check for duplicate fixed regressors that may appear in CandidateRegressors. There are edge cases, for example, when
+    # using the fixed_coefficients where duplicates caught downstream in train(...) are no longer caught due to the offset
+    # created by the fixed coefficient (e.g. let the current model be Fy = v + w) where both v and w are fixed but only w 
+    # has a fixed coefficient. If 'v^1' appears in the candidate regressors, then we will see that we cannot perfectly explain
+    # v with Fy due to the presence of w. Thus, the algorithm thinks v is a 'new' regressor when, in fact, it is a duplicate.
+    CandidateArray = np.array(list(CandidateRegressors.values())).reshape(len(CandidateRegressors), -1).T
+    CandidateKeys = list(CandidateRegressors.keys())
+    dupes = []
+    for reg in FixedRegressors.values():
+        diff = CandidateArray - reg.__array__()
+        i = np.where(np.isclose(diff.sum(axis=0), 0))[0]
+        if len(i):
+            for _i in i:
+                _dupe = CandidateKeys[_i.astype(int)]
+                if _dupe not in dupes:
+                    dupes.append(_dupe)
+                    # Remove dupe from CandidateRegressor pool
+                    CandidateRegressors.pop(_dupe)
+
     # CompiledModel = {'Candidate Regressors':CandidateRegressors, 'Fixed Regressors':FixedRegressors, 'data':data, 'Has Bias':includeBias}
-    CompiledModel = {'Candidate Regressors':CandidateRegressors, 'Fixed Regressors':FixedRegressors, 'Has Bias':includeBias, 'Candidate Polynomials':polys}
+    CompiledModel = {'Candidate Regressors':CandidateRegressors, 'Fixed Regressors':FixedRegressors, 'Has Bias':includeBias, 'Candidate Polynomials':polys, "Fixed Coefficients":fixed_coefficients}
 
     return CompiledModel
 
 
-
+# TODO: Move fixed coefficients to compile. Then can structure in correct way such that other functions can use it
 def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE', Fin = 4, Fout = 4, k_lim = 10, force_k_lim = False):
     '''Function to identify a model using stepwise regression 
 
     :param CompiledModel: Dictionary containing the necessary polynomial regressors for the model. Equivalent to the output of function <compile>. 
     :param TrainingInputs: Unused but remains for compatibility with SysID.Model object . 
     :param TrainingTargets: Pandas DataFrame of the target data used for model identification. Shape is [N x 1] where N = the number of observations (samples). 
+    :param fixed_coefficients: Optional dictionary mapping fixed regressor to a coefficient value. This coefficient value will be used for the regressor in the model. Leave empty if coefficient is free.
     :param stop_criteria: Dictates what stopping criteria to use. Default is 'PSE' (Predict Square Error)
         :Options are: 
             'PSE' (Predict square error),
@@ -426,13 +473,15 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     #   F0 = F statistic
     #   F0>Fin = Boolean indicating if the scheduled regressor significantly 
     #       improves model performance under Fin. 
-    def _checkFin(A, IncomingRegressor, z, Fin, hasBias = True):
+    # def _checkFin(A, IncomingRegressor, z, Fin, hasBias = True):
+    def _checkFin(A, IncomingRegressor, z, Fin, hasBias = True, coeff_mapping = {}):
         [na, pa] = A.shape
         
         # Add incoming regressor to A matrix
         Ax = np.matrix(np.hstack((A, IncomingRegressor)))
         # Perform OLS with new A matrix
-        [params0, pred0] = _OLS(Ax, z, hasBias)
+        # [params0, pred0] = _OLS(Ax, z, hasBias)
+        [params0, pred0] = _OLS_FLEX(Ax, z, hasBias = hasBias, fixed_mapping = coeff_mapping)
 
         SS0 = params0.T * Ax.T * z - na*np.nanmean(z)**2
         
@@ -460,11 +509,12 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     #   RemoveIdx = Column index in A of regressor to be removed. If no regressors should be removed
     #       then RemoveIdx = None
     #   F0 = F statistic
-    def _CheckFout(A, z, Fout, pf, hasBias = True):
+    def _CheckFout(A, z, Fout, pf, hasBias = True, coeff_mapping = {}):
         [na, pa] = A.shape
 
         # Obtain current model performance
-        [params0, pred0] = _OLS(A, z, hasBias = hasBias)
+        # [params0, pred0] = _OLS(A, z, hasBias = hasBias)
+        [params0, pred0] = _OLS_FLEX(A, z, hasBias = hasBias, fixed_mapping = coeff_mapping)
         SS0 = params0.T * A.T * z - na*np.nanmean(z)**2
         s2 = np.sum(np.square(z - pred0))/(na-pa)
 
@@ -473,7 +523,8 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
         F0_lst = np.ones((pa,1)) * Fout
         for j in np.arange(pf,pa, 1):
             _A = np.delete(A, j, 1)
-            [params1, pred1] = _OLS(_A, z, hasBias = hasBias)
+            # [params1, pred1] = _OLS(_A, z, hasBias = hasBias)
+            [params1, pred1] = _OLS_FLEX(_A, z, hasBias = hasBias, fixed_mapping = coeff_mapping)
             SS1 = params1.T * _A.T * z - na*np.nanmean(z)**2
 
             F0_lst[j] = (SS0-SS1)/s2
@@ -522,13 +573,14 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     #   Stop = Boolean indicating if algorithm should be stopped
     #   [A, parameters, CurrentRegressors] = Either equivalent to the variables in the current step or the
     #       previous step depending on if the stopping criteria is met or not. 
-    def _checkPSE(CriterionDict, A, parameters, CurrentRegressors, targets, PSEThreshold, RemoveLog, hasBias = True):
+    def _checkPSE(CriterionDict, A, parameters, CurrentRegressors, targets, PSEThreshold, RemoveLog, hasBias = True, coeff_mapping = {}):
         Stop = False
         # Check if PSE has increased. If so, take [A, parameters, CurrentRegressors] of previous step
         # if CriterionDict['PSE']['new'] >= CriterionDict['PSE']['old']*0.99:
         if CriterionDict['PSE']['new'] >= CriterionDict['PSE']['old']:
             A = CriterionDict['A']['old']
-            [parameters, predictions] = _OLS(A, targets, hasBias)
+            # [parameters, predictions] = _OLS(A, targets, hasBias)
+            [parameters, predictions] = _OLS_FLEX(A, targets, hasBias = hasBias, fixed_mapping = coeff_mapping)
             CurrentRegressors.pop(max(CurrentRegressors, key = CurrentRegressors.get))
             # If there was a regressor removed in the current step, we need to identify it and re-add it to
             # the CurrentRegressors in the correct index. 
@@ -597,11 +649,12 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     # Outputs:
     #   Stop = Boolean indicating if algorithm should be stopped
     #   [A, parameters, CurrentRegressors] = Either equivalent to the variables of the previous step
-    def _checkF0(CriterionDict, A, parameters, CurrentRegressors, targets, *args, hasBias = True):
+    def _checkF0(CriterionDict, A, parameters, CurrentRegressors, targets, *args, hasBias = True, coeff_mapping = {}):
         Stop = False
         if CriterionDict['F0']['new'] <= CriterionDict['F0']['old']:
             A = CriterionDict['A']['old']
-            [parameters, predictions] = _OLS(A, targets, hasBias = hasBias)
+            # [parameters, predictions] = _OLS(A, targets, hasBias = hasBias)
+            [parameters, predictions] = _OLS_FLEX(A, targets, hasBias = hasBias, fixed_mapping = coeff_mapping)
             CurrentRegressors.pop(max(CurrentRegressors, key = CurrentRegressors.get))
             Stop = True 
             print('[ INFO ] F0 has reached its maximum value. Stopping algorithm.')
@@ -639,7 +692,19 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     [N, p] = RegressorMatrix.shape
     # Number of fixed parameters
     pf = p
-    [params, pred] = _OLS(RegressorMatrix, TrainingTargets, hasBias = hasBias)
+    # [params, pred] = _OLS(RegressorMatrix, TrainingTargets, hasBias = hasBias)
+    fixed_coefficients = CompiledModel['Fixed Coefficients']
+    # offset = 1 if hasBias else 0
+    offset = 0
+    # coeff_mapping = {_c + offset:{'coeff':fc, 'regressor':r} for _c, (r, fc) in enumerate(fixed_coefficients.items())}
+    coeff_mapping = {}
+    for _c, r in enumerate(CompiledModel['Fixed Regressors']):
+        if r in fixed_coefficients.keys():
+            coeff_mapping.update({_c + offset:{
+                'coeff':fixed_coefficients[r],
+                'regressor':r
+            }})
+    [params, pred] = _OLS_FLEX(RegressorMatrix, TrainingTargets, hasBias = hasBias, fixed_mapping = coeff_mapping)
     PSE = _PSE(pred, TrainingTargets, p)
     R2 = _CoeffOfDetermination_R2(pred, TrainingTargets)
     # Special handle for when fixed regressors other than the bias vector are added. 
@@ -652,8 +717,8 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     print('[ INFO ] Initial values')
     print('[ INFO ] Selected regressor: {}'.format(None))
     print('[ INFO ] Removed regressor: {}'.format(None))
-    print('[ INFO ] Predict square error: {}'.format(float(PSE),))
-    print('[ INFO ] Coefficient of Determination (R2): {}'.format(float(R2)))
+    print('[ INFO ] Predict square error: {}'.format(float(PSE.__array__()[0][0])))
+    print('[ INFO ] Coefficient of Determination (R2): {}'.format(float(R2.__array__()[0][0])))
 
     # Initialize CriterionDict. CriterionDict keeps track of the stopping criterion 
     # of the current and previous steps. 
@@ -665,10 +730,18 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
     # Define PSE threshold based on initial PSE
     PSE_thresh = 0.001*PSE
 
-    # Begin at step, k = 1
-    k = 1
-    selecting = True
-    
+    # Skip candidate selection if k_lim == 0 or candidate regressors are empty
+    if not CompiledModel['Candidate Regressors']:
+        print('[ WARNING ] Candidate regressors appear empty. Continuing with fixed regressor model identification.')
+        k_lim = 0
+    if k_lim == 0:
+        selecting = False
+        Final_RegressorMatrix, Final_Parameters = RegressorMatrix, params
+    else:
+        # Begin at step, k = 1
+        k = 1
+        selecting = True
+        
     while selecting:
 
         e = TrainingTargets - pred
@@ -677,7 +750,8 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
         # Determine correlation of candidates in candidate pool with error, e
         Candidates_r = {}
         for candidate, values in CandidateRegressors.items():
-            [params_C, pred_C] = _OLS(RegressorMatrix, values, hasBias = hasBias)
+            # [params_C, pred_C] = _OLS(RegressorMatrix, values, hasBias = hasBias)
+            [params_C, pred_C] = _OLS_FLEX(RegressorMatrix, values, hasBias = hasBias, fixed_mapping = coeff_mapping)
             e_C = values - pred_C
             Sjj_C = np.sum(np.square((e_C - np.nanmean(e_C))))
             Szz_C = np.sum(np.square((e - np.nanmean(e))))
@@ -690,7 +764,7 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
         Candidate_IN = max(Candidates_r, key=Candidates_r.get)
         
         # Schedule Candidate_IN for addition to RegressorMatrix
-        ToAdd = _checkFin(RegressorMatrix, CandidateRegressors[Candidate_IN], TrainingTargets, Fin, hasBias = hasBias)[1]
+        ToAdd = _checkFin(RegressorMatrix, CandidateRegressors[Candidate_IN], TrainingTargets, Fin, hasBias = hasBias, coeff_mapping=coeff_mapping)[1]
 
         # Add Candidate_IN if _checkFin is successful (i.e. Candidate_IN significantly improves 
         # model performance)
@@ -717,7 +791,7 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
         
         # ---------BACKWARD STEP---------
         # Check if any of the current regressors have been made redundant
-        [ToRemove, F0_out] = _CheckFout(RegressorMatrix, TrainingTargets, Fout, pf, hasBias=hasBias)
+        [ToRemove, F0_out] = _CheckFout(RegressorMatrix, TrainingTargets, Fout, pf, hasBias=hasBias, coeff_mapping=coeff_mapping)
 
         # If current regressors are all essential for maintaining model accuracy
         if ToRemove is None:
@@ -740,7 +814,8 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
             
         # Check general termination condition: if added regressor is the same as removed regressor
         if Candidate_IN == Candidate_OUT:
-            [params, pred] = _OLS(RegressorMatrix, TrainingTargets, hasBias = hasBias)
+            # [params, pred] = _OLS(RegressorMatrix, TrainingTargets, hasBias = hasBias)
+            [params, pred] = _OLS_FLEX(RegressorMatrix, TrainingTargets, hasBias = hasBias, fixed_mapping = coeff_mapping)
             Final_RegressorMatrix, Final_Parameters = RegressorMatrix, params
             print('[ INFO ] Added regressor is the same as removed for step {}. Terminating...'.format(k))
             selecting = False
@@ -750,7 +825,8 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
             break 
         
         # Calculate metrics for current model structure
-        [params, pred] = _OLS(RegressorMatrix, TrainingTargets, hasBias = hasBias)
+        # [params, pred] = _OLS(RegressorMatrix, TrainingTargets, hasBias = hasBias)
+        [params, pred] = _OLS_FLEX(RegressorMatrix, TrainingTargets, hasBias = hasBias, fixed_mapping = coeff_mapping)
         p = RegressorMatrix.shape[1]
         PSE = _PSE(pred, TrainingTargets, p)
         R2 = _CoeffOfDetermination_R2(pred, TrainingTargets)
@@ -767,8 +843,8 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
         print('[ INFO ] Bias: {}'.format(params[0]))
         print('[ INFO ] Selected regressor: {}'.format(Candidate_IN))
         print('[ INFO ] Removed regressor: {}'.format(Candidate_OUT))
-        print('[ INFO ] Predict square error: {}'.format(float(PSE),))
-        print('[ INFO ] Coefficient of Determination (R2): {}'.format(float(R2)))
+        print('[ INFO ] Predict square error: {}'.format(float(PSE.__array__()[0][0]),))
+        print('[ INFO ] Coefficient of Determination (R2): {}'.format(float(R2.__array__()[0][0])))
 
         # Check additional stopping critera
         checks = {'PSE': _checkPSE,
@@ -776,7 +852,7 @@ def train(CompiledModel, TrainingInputs, TrainingTargets, stop_criteria = 'PSE',
                     'F0': _checkF0}
         # If user selected one of the known stopping criteria
         if stop_criteria in checks.keys():
-            Stop, [Final_RegressorMatrix, Final_Parameters, Added_Candidates] = checks[stop_criteria](CriterionDict, RegressorMatrix, params, Added_Candidates, TrainingTargets, PSE_thresh, Remove_Log, hasBias=hasBias)
+            Stop, [Final_RegressorMatrix, Final_Parameters, Added_Candidates] = checks[stop_criteria](CriterionDict, RegressorMatrix, params, Added_Candidates, TrainingTargets, PSE_thresh, Remove_Log, hasBias=hasBias, coeff_mapping=coeff_mapping)
             if force_k_lim and not Stop:
                 if k >= k_lim:
                     Stop = True
@@ -884,7 +960,7 @@ def evaluate(Model, inputs, target, showPlots = True):
     A = Model['Model']['A']
     # Using: sigma = e.T * e / (N - p)
     mse = np.matrix(error).T * np.matrix(error) / (N - min(A.shape))
-    COV = float(mse) * np.linalg.inv((A.T * A))
+    COV = float(mse.__array__()[0][0]) * np.linalg.inv((A.T * A))
     coeffVariance = np.diag(COV)
     coeffIndex = np.arange(1, min(A.shape) + 1, 1)
 
@@ -917,8 +993,8 @@ def evaluate(Model, inputs, target, showPlots = True):
         ax2 = fig2.add_subplot(111)
         # plt.title('Residual error autocorrelation')
         ax2.plot(lag, autocorrelation, color = 'royalblue', label = 'Residual error')
-        ax2.plot(lag, confidenceBounds*np.ones(lag.shape), color = 'tab:red', linestyle = '--', label='95% confidence bounds')
-        ax2.plot(lag, -confidenceBounds*np.ones(lag.shape), color='tab:red', linestyle = '--')
+        # ax2.plot(lag, confidenceBounds*np.ones(lag.shape), color = 'tab:red', linestyle = '--', label='95% confidence bounds')
+        # ax2.plot(lag, -confidenceBounds*np.ones(lag.shape), color='tab:red', linestyle = '--')
         ax2.set_xlabel(r'$\mathbf{Lag} \quad [-]$')
         ax2.set_ylabel(r'$\mathbf{Autocorrelation} \quad [-]$')
         ax2.tick_params(which='both', direction='in')
@@ -930,7 +1006,8 @@ def evaluate(Model, inputs, target, showPlots = True):
         fig3 = plt.figure('Coefficient variance')
         ax3 = fig3.add_subplot(111)
         # plt.title('Coefficient variance')
-        ax3.bar(coeffIndex, np.array(Model['Model']['Parameters']).reshape(coeffIndex.shape), color='royalblue', label='Polynomial coefficients')
+        # ax3.bar(coeffIndex, np.array(Model['Model']['Parameters']).reshape(coeffIndex.shape), color='royalblue', label='Polynomial coefficients')
+        ax3.bar(coeffIndex, np.abs(np.array(Model['Model']['Parameters']).reshape(coeffIndex.shape)), color='royalblue', label='Polynomial coefficients')
         ax3.bar(coeffIndex, np.array(coeffVariance).reshape(coeffIndex.shape), color='orangered', label='Coefficient variance')
         ax3.grid()
         ax3.set_xlabel(r'$\mathbf{Regressor}$')
@@ -984,7 +1061,7 @@ def summary(Status, Model):
         print('-'*65)
         for i, r in enumerate(Model['Model']['Regressors']):
             # print('{:<65}'.format(r))
-            print('{:<54} {:.3e}'.format(r.replace(' ', ''), float(Model['Model']['Parameters'][i])))
+            print('{:<54} {:.3e}'.format(r.replace(' ', ''), float(Model['Model']['Parameters'][i].__array__()[0][0])))
         print('_'*65)
         print('{:<25} {:>39}'.format('Total number of terms', len(Model['Model']['Regressors'])))
         print('_'*65)
@@ -1092,7 +1169,8 @@ def trimModel(polyModel, cutoff):
     y_train = polyModel.y_train
     _regressors = polyModel.TrainedModel['Model']['Regressors'][:cutoff]
     A = _BuildRegressorMatrix(_regressors, x_train, hasBias = polyModel.TrainedModel['Model']['Has Bias'])
-    [params, _] = _OLS(A, np.array(y_train).reshape(-1, 1), hasBias = polyModel.TrainedModel['Model']['Has Bias'])
+    # [params, _] = _OLS(A, np.array(y_train).reshape(-1, 1), hasBias = polyModel.TrainedModel['Model']['Has Bias'])
+    [params, _] = _OLS_FLEX(A, np.array(y_train).reshape(-1, 1), hasBias = polyModel.TrainedModel['Model']['Has Bias'], fixed_mapping=polyModel.CompiledModel['Fixed Coefficients'])
     reducedModel = {}
     for k, v in polyModel.TrainedModel['Model'].items():
         reducedModel.update({k:v})
@@ -1120,7 +1198,8 @@ def dropRegressor(polyModel, index, retrain = True):
     _regressors = polyModel.TrainedModel['Model']['Regressors'][:index] + polyModel.TrainedModel['Model']['Regressors'][(index+1):]
     if retrain:
         A = _BuildRegressorMatrix(_regressors, x_train, hasBias = polyModel.TrainedModel['Model']['Has Bias'])
-        [params, _] = _OLS(A, np.array(y_train).reshape(-1, 1), hasBias = polyModel.TrainedModel['Model']['Has Bias'])
+        # [params, _] = _OLS(A, np.array(y_train).reshape(-1, 1), hasBias = polyModel.TrainedModel['Model']['Has Bias'])
+        [params, _] = _OLS_FLEX(A, np.array(y_train).reshape(-1, 1), hasBias = polyModel.TrainedModel['Model']['Has Bias'], fixed_mapping = polyModel.CompiledModel['Fixed Coefficients'])
         reducedModel = {}
         for k, v in polyModel.TrainedModel['Model'].items():
             reducedModel.update({k:v})
