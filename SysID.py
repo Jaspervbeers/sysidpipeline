@@ -20,6 +20,10 @@ import pandas as pd
 # ================================================================================================================================ #
 # Local Imports
 # ================================================================================================================================ #
+from pathlib import Path
+import sys
+LIB_PATH = Path(__file__).resolve().parent.resolve()
+sys.path.insert(0, str(LIB_PATH))
 try:
     from Utility import Utility
 except ImportError:
